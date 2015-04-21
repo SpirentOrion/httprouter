@@ -11,15 +11,17 @@
 //  import (
 //      "fmt"
 //      "github.com/julienschmidt/httprouter"
+//      "golang.org/x/net/context"
 //      "net/http"
 //      "log"
 //  )
 //
-//  func Index(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+//  func Index(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 //      fmt.Fprint(w, "Welcome!\n")
 //  }
 //
-//  func Hello(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+//  func Hello(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+//      ps := ContextParams(ctx)
 //      fmt.Fprintf(w, "hello, %s!\n", ps.ByName("name"))
 //  }
 //
@@ -65,8 +67,8 @@
 //   /files                              no match, but the router would redirect
 //
 // The value of parameters is saved as a slice of the Param struct, consisting
-// each of a key and a value. The slice is passed to the Handle func as a third
-// parameter.
+// each of a key and a value. The slice is available as a context value in the
+// handler.
 // There are two ways to retrieve the value of a parameter:
 //  // by the name of the parameter
 //  user := ps.ByName("user") // defined by :user or *user
@@ -78,12 +80,17 @@ package httprouter
 
 import (
 	"net/http"
+
+	"golang.org/x/net/context"
 )
 
+type contextKeyT int
+
+var contextParamsKey = contextKeyT(0)
+
 // Handle is a function that can be registered to a route to handle HTTP
-// requests. Like http.HandlerFunc, but has a third parameter for the values of
-// wildcards (variables).
-type Handle func(http.ResponseWriter, *http.Request, Params)
+// requests. Like http.HandlerFunc, but has a third parameter for context.
+type Handle func(context.Context, http.ResponseWriter, *http.Request)
 
 // Param is a single URL parameter, consisting of a key and a value.
 type Param struct {
@@ -95,6 +102,12 @@ type Param struct {
 // The slice is ordered, the first URL parameter is also the first slice value.
 // It is therefore safe to read values by the index.
 type Params []Param
+
+// ContextParams returns the params from a context, if possible.
+func ContextParams(ctx context.Context) Params {
+	ps, _ := ctx.Value(contextParamsKey).(Params)
+	return ps
+}
 
 // ByName returns the value of the first Param which key matches the given name.
 // If no matching Param is found, an empty string is returned.
@@ -138,21 +151,21 @@ type Router struct {
 	// handler.
 	HandleMethodNotAllowed bool
 
-	// Configurable http.HandlerFunc which is called when no matching route is
+	// Configurable Handle which is called when no matching route is
 	// found. If it is not set, http.NotFound is used.
-	NotFound http.HandlerFunc
+	NotFound Handle
 
-	// Configurable http.HandlerFunc which is called when a request
+	// Configurable Handle which is called when a request
 	// cannot be routed and HandleMethodNotAllowed is true.
 	// If it is not set, http.Error with http.StatusMethodNotAllowed is used.
-	MethodNotAllowed http.HandlerFunc
+	MethodNotAllowed Handle
 
 	// Function to handle panics recovered from http handlers.
 	// It should be used to generate a error page and return the http error code
 	// 500 (Internal Server Error).
 	// The handler can be used to keep your server from crashing because of
 	// unrecovered panics.
-	PanicHandler func(http.ResponseWriter, *http.Request, interface{})
+	PanicHandler func(context.Context, http.ResponseWriter, *http.Request, interface{})
 }
 
 // Make sure the Router conforms with the http.Handler interface
@@ -233,7 +246,7 @@ func (r *Router) Handle(method, path string, handle Handle) {
 // request handle.
 func (r *Router) Handler(method, path string, handler http.Handler) {
 	r.Handle(method, path,
-		func(w http.ResponseWriter, req *http.Request, _ Params) {
+		func(_ context.Context, w http.ResponseWriter, req *http.Request) {
 			handler.ServeHTTP(w, req)
 		},
 	)
@@ -262,15 +275,16 @@ func (r *Router) ServeFiles(path string, root http.FileSystem) {
 
 	fileServer := http.FileServer(root)
 
-	r.GET(path, func(w http.ResponseWriter, req *http.Request, ps Params) {
+	r.GET(path, func(ctx context.Context, w http.ResponseWriter, req *http.Request) {
+		ps := ContextParams(ctx)
 		req.URL.Path = ps.ByName("filepath")
 		fileServer.ServeHTTP(w, req)
 	})
 }
 
-func (r *Router) recv(w http.ResponseWriter, req *http.Request) {
+func (r *Router) recv(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 	if rcv := recover(); rcv != nil {
-		r.PanicHandler(w, req, rcv)
+		r.PanicHandler(ctx, w, req, rcv)
 	}
 }
 
@@ -288,15 +302,20 @@ func (r *Router) Lookup(method, path string) (Handle, Params, bool) {
 
 // ServeHTTP makes the router implement the http.Handler interface.
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	r.HandleHTTP(context.Background(), w, req)
+}
+
+// HandleHTTP is a context-aware variant of ServeHTTP.
+func (r *Router) HandleHTTP(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 	if r.PanicHandler != nil {
-		defer r.recv(w, req)
+		defer r.recv(ctx, w, req)
 	}
 
 	if root := r.trees[req.Method]; root != nil {
 		path := req.URL.Path
 
 		if handle, ps, tsr := root.getValue(path); handle != nil {
-			handle(w, req, ps)
+			handle(context.WithValue(ctx, contextParamsKey, ps), w, req)
 			return
 		} else if req.Method != "CONNECT" && path != "/" {
 			code := 301 // Permanent redirect, request with GET method
@@ -342,7 +361,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			handle, _, _ := r.trees[method].getValue(req.URL.Path)
 			if handle != nil {
 				if r.MethodNotAllowed != nil {
-					r.MethodNotAllowed(w, req)
+					r.MethodNotAllowed(ctx, w, req)
 				} else {
 					http.Error(w,
 						http.StatusText(http.StatusMethodNotAllowed),
@@ -356,7 +375,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	// Handle 404
 	if r.NotFound != nil {
-		r.NotFound(w, req)
+		r.NotFound(ctx, w, req)
 	} else {
 		http.NotFound(w, req)
 	}

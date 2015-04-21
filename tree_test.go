@@ -10,6 +10,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"golang.org/x/net/context"
 )
 
 func printChildren(n *node, prefix string) {
@@ -26,7 +28,7 @@ func printChildren(n *node, prefix string) {
 var fakeHandlerValue string
 
 func fakeHandler(val string) Handle {
-	return func(http.ResponseWriter, *http.Request, Params) {
+	return func(context.Context, http.ResponseWriter, *http.Request) {
 		fakeHandlerValue = val
 	}
 }
